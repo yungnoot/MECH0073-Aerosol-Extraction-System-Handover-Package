@@ -13,7 +13,6 @@ The design is underpinned by Euler–Lagrange CFD simulations in OpenFOAM, valid
 This repository serves as the central handover package for prototype evaluation and future project continuation.
 
 ## What's in this repo
-- `CFD/` — OpenFOAM solver and post-processing scripts
 - `CAD/` — Assembly and part drawings for the experimental rig and extractor prototype
 - `Electronics/` — Arduino sensor control code and wiring schematics
 - `Documentation/` — Risk assessments, Bill of Materials, Product Design Specification, and end-of-life plan
