@@ -1,0 +1,490 @@
+#include <Wire.h>
+#include <DHT.h>
+#include <SensirionI2CSdp.h>
+#include <U8g2lib.h>
+
+// ---------------- Addresses ----------------
+
+#define TCA_ADDR 0x70   // I2C address of the TCA9548A multiplexer chip
+#define SDP_ADDR 0x25   // I2C address of each SDP differential pressure sensor
+
+// ---------------- Channels ----------------
+
+#define SDP1_CHANNEL 2  // Mux channel for the "before filter" pressure sensor
+#define SDP2_CHANNEL 3  // Mux channel for the "after filter" pressure sensor
+
+// ---------------- Limits ----------------
+
+#define SDP_MAX_RANGE_PA 500.0  // Readings beyond ±500 Pa are treated as out-of-range
+
+// ---------------- Temperature failsafe ----------------
+
+#define TEMP_SHUTDOWN_C 40  // Trigger emergency shutdown if ambient temp reaches 40 °C
+#define TEMP_RESET_C    35  // Allow recovery once temp drops back to 35 °C
+
+#define SHUTDOWN_PIN 8      // Digital output pin that cuts power to external hardware
+
+bool shutdownActive = false;  // Tracks whether the thermal failsafe is currently engaged
+
+// ---------------- DHT ----------------
+
+#define DHTPIN 2        // Arduino pin connected to the DHT11 data line
+#define DHTTYPE DHT11   // Sensor model (DHT11 vs DHT22)
+
+DHT dht(DHTPIN, DHTTYPE);  // Create the DHT sensor object
+
+// ---------------- Sensors ----------------
+
+SensirionI2CSdp sdp;  // Single driver instance reused for both SDP sensors (selected via mux)
+
+// ---------------- OLED ----------------
+
+// 128×64 SSD1309 display driven over hardware I2C in page-buffer (1-page) mode
+U8G2_SSD1309_128X64_NONAME0_1_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------------- Status flags ----------------
+
+bool sdp1Started = false;  // True once SDP1 has been successfully initialised
+bool sdp2Started = false;  // True once SDP2 has been successfully initialised
+
+// ---------------- TCA ----------------
+
+// Route I2C traffic to a single mux channel (0–7) by writing the bitmask
+void selectMuxChannel(uint8_t channel) {
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);   // Set only the bit that corresponds to the requested channel
+  Wire.endTransmission();
+  delay(30);  // Short settle time so the mux stabilises before the next I2C transaction
+}
+
+// Disable all mux channels so no sensor is on the bus (avoids address conflicts)
+void disableMux() {
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(0);  // Writing 0 turns off every channel
+  Wire.endTransmission();
+  delay(10);
+}
+
+// ---------------- Checks ----------------
+
+// Probe an I2C address — returns true if a device ACKs (i.e. it exists and is alive)
+bool deviceExists(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;  // 0 = ACK received
+}
+
+// Check whether an SDP sensor is present on the given mux channel
+bool sdpExistsOnChannel(uint8_t channel) {
+  selectMuxChannel(channel);  // Switch mux to the target channel first
+
+  Wire.beginTransmission(SDP_ADDR);
+  byte error = Wire.endTransmission();
+
+  return error == 0;  // ACK means a device is at SDP_ADDR on this channel
+}
+
+// Validate that a pressure reading is within the sensor's usable range
+bool pressureInRange(float pressurePa) {
+  return abs(pressurePa) <= SDP_MAX_RANGE_PA;
+}
+
+// ---------------- SDP start/read ----------------
+
+// Initialise one SDP sensor via the mux; returns true on success
+bool startSdpOnChannel(uint8_t channel) {
+  selectMuxChannel(channel);
+
+  if (!sdpExistsOnChannel(channel)) {
+    Serial.print(F("No SDP found on channel "));
+    Serial.println(channel);
+    return false;
+  }
+
+  sdp.begin(Wire, SDP_ADDR);  // Attach the driver to this sensor
+
+  sdp.stopContinuousMeasurement();  // Stop any leftover measurement from a previous session
+  delay(100);
+
+  // Start continuous differential-pressure measurement with temperature compensation and averaging
+  uint16_t error = sdp.startContinuousMeasurementWithDiffPressureTCompAndAveraging();
+
+  if (error) {
+    Serial.print(F("SDP start error on channel "));
+    Serial.print(channel);
+    Serial.print(F(": "));
+    Serial.println(error);
+    return false;
+  }
+
+  Serial.print(F("SDP started on channel "));
+  Serial.println(channel);
+  delay(100);  // Give the sensor a moment to begin producing measurements
+
+  return true;
+}
+
+// Read the latest measurement from one SDP sensor; fills pressurePa and sensorTempC by reference
+bool readSdpOnChannel(uint8_t channel, float &pressurePa, float &sensorTempC) {
+  selectMuxChannel(channel);  // Point the mux at the right sensor before reading
+
+  uint16_t error = sdp.readMeasurement(pressurePa, sensorTempC);
+
+  if (error) {
+    Serial.print(F("SDP read error on channel "));
+    Serial.print(channel);
+    Serial.print(F(": "));
+    Serial.println(error);
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------- Display helpers ----------------
+
+// Print a single pressure value to the OLED, with error/range guards
+void printPressureOLED(float pressure, bool ok) {
+  if (!ok) {
+    display.print(F("ERR"));          // Sensor failed to read
+  } else if (!pressureInRange(pressure)) {
+    display.print(F(">500"));         // Reading is outside the valid ±500 Pa window
+  } else {
+    display.print(pressure, 1);       // Normal case: one decimal place
+  }
+}
+
+// Render the main data screen (called every loop iteration)
+void drawScreen(float p1, bool p1Ok,
+                float p2, bool p2Ok,
+                float diff,
+                float tempC,
+                float humidity,
+                bool dhtOk) {
+  disableMux();  // Keep the I2C bus clear for the display (no sensor should be selected)
+
+  display.setPowerSave(0);  // Wake the display if it was in sleep mode
+
+  display.firstPage();  // Begin the U8g2 page-loop (redraws the whole screen)
+
+  do {
+    display.setFont(u8g2_font_6x12_tf);  // Small, readable monospace font for data lines
+
+    // Row 1 — ambient temperature and humidity from the DHT11
+    display.setCursor(0, 10);
+    if (dhtOk) {
+      display.print(F("T:"));
+      display.print(tempC, 1);
+      display.print(F("\xB0""C H:"));  // \xB0 is the degree symbol in this font encoding
+      display.print(humidity, 0);
+      display.print(F("%"));
+    } else {
+      display.print(F("DHT: ERR"));  // DHT11 read failed
+    }
+
+    // Row 2 — column header
+    display.setCursor(0, 22);
+    display.print(F("Gauge Pressure (Pa)"));
+
+    // Row 3 — pressure upstream of the filter (SDP1)
+    display.setCursor(0, 34);
+    display.print(F("Before Filter: "));
+    printPressureOLED(p1, p1Ok);
+
+    // Row 4 — pressure downstream of the filter (SDP2)
+    display.setCursor(0, 46);
+    display.print(F("After Filter: "));
+    printPressureOLED(p2, p2Ok);
+
+    // Row 5 — differential (p1 − p2), shown only when both readings are valid and in range
+    display.setCursor(0, 58);
+    display.print(F("Difference: "));
+    if (p1Ok && p2Ok && pressureInRange(p1) && pressureInRange(p2)) {
+      display.print(diff, 1);
+    } else {
+      display.print(F("ERR"));
+    }
+
+  } while (display.nextPage());  // Keep looping until all pages have been written to the panel
+}
+
+// Display a startup splash screen while sensors initialise
+void showBootScreen() {
+  disableMux();
+
+  display.setPowerSave(0);
+
+  display.firstPage();
+
+  do {
+    display.setFont(u8g2_font_6x12_tf);
+
+    display.setCursor(0, 12);
+    display.print(F("Booting..."));
+
+    display.setCursor(0, 28);
+    display.print(F("I <3 UCL + AGFA"));  // Project credit line
+
+    display.setCursor(0, 44);
+    display.print(F("Loading..."));
+
+  } while (display.nextPage());
+}
+
+// Show a 3-2-1 countdown before triggering the thermal shutdown
+void showCountdownScreen(int count, float tempC) {
+  disableMux();
+
+  display.setPowerSave(0);
+
+  display.firstPage();
+
+  do {
+    display.setFont(u8g2_font_6x12_tf);
+
+    display.setCursor(0, 10);
+    display.print(F("TEMP FAILSAFE"));
+
+    display.setCursor(0, 24);
+    display.print(F("Temp: "));
+    display.print(tempC, 1);
+    display.print(F("\xB0""C"));
+
+    display.setCursor(0, 40);
+    display.print(F("Shut down in:"));
+
+    // Use a larger font just for the countdown digit so it's clearly visible
+    display.setFont(u8g2_font_logisoso20_tf);
+    display.setCursor(56, 64);
+    display.print(count);
+
+  } while (display.nextPage());
+}
+
+// Blank the display and put it into power-save (sleep) mode
+void turnOffOLED() {
+  disableMux();
+
+  display.clearBuffer();   // Wipe the internal frame buffer
+  display.sendBuffer();    // Push the blank buffer to the panel
+
+  delay(100);
+
+  display.setPowerSave(1);  // Send the display controller to sleep
+}
+
+// ---------------- Failsafe ----------------
+
+// Called when ambient temperature exceeds TEMP_SHUTDOWN_C.
+// Shows a 3-second countdown then cuts power and disables sensors/display.
+void enterShutdown(float tempC) {
+  Serial.println(F("FAILSAFE TRIGGERED: temperature too high."));
+
+  // Visual countdown so the operator knows a shutdown is imminent
+  showCountdownScreen(3, tempC);
+  delay(1000);
+
+  showCountdownScreen(2, tempC);
+  delay(1000);
+
+  showCountdownScreen(1, tempC);
+  delay(1000);
+
+  shutdownActive = true;
+
+  digitalWrite(SHUTDOWN_PIN, LOW);  // Pull the pin LOW to cut power to external hardware
+
+  disableMux();  // Release I2C bus before stopping sensor state
+
+  // Mark both sensors as uninitialised so they'll be restarted after recovery
+  sdp1Started = false;
+  sdp2Started = false;
+
+  turnOffOLED();  // Save power and protect the panel
+
+  Serial.println(F("FAILSAFE ACTIVE: OLED OFF."));
+}
+
+// Called when temperature drops back below TEMP_RESET_C.
+// Restores power, wakes the display, and re-initialises the pressure sensors.
+void exitShutdown() {
+  shutdownActive = false;
+
+  digitalWrite(SHUTDOWN_PIN, HIGH);  // Restore power to external hardware
+
+  display.setPowerSave(0);  // Wake the display
+
+  Serial.println(F("FAILSAFE CLEARED: OLED ON, restarting sensors."));
+
+  showBootScreen();  // Show splash while sensors come back up
+
+  // Re-initialise both SDP sensors now that power is restored
+  sdp1Started = startSdpOnChannel(SDP1_CHANNEL);
+  sdp2Started = startSdpOnChannel(SDP2_CHANNEL);
+}
+
+// ---------------- Setup ----------------
+
+void setup() {
+  Wire.begin();           // Initialise the I2C bus
+  Serial.begin(115200);   // Open serial port for debug logging
+  dht.begin();            // Initialise the DHT11 temperature/humidity sensor
+
+  pinMode(SHUTDOWN_PIN, OUTPUT);
+  digitalWrite(SHUTDOWN_PIN, HIGH);  // Default HIGH = power on; LOW triggers shutdown
+
+  delay(1000);  // Brief pause to let power rails settle before talking to I2C devices
+
+  // The U8g2 library needs the 8-bit I2C address (7-bit << 1)
+  display.setI2CAddress(0x3C * 2);
+  display.begin();
+  display.setPowerSave(0);
+
+  showBootScreen();  // Show splash screen while the rest of setup runs
+
+  Serial.println(F("System starting..."));
+
+  // Confirm the I2C mux is present before trying to use it
+  if (deviceExists(TCA_ADDR)) {
+    Serial.println(F("TCA9548A detected."));
+  } else {
+    Serial.println(F("TCA9548A NOT detected."));
+  }
+
+  // Start both pressure sensors via their respective mux channels
+  sdp1Started = startSdpOnChannel(SDP1_CHANNEL);
+  sdp2Started = startSdpOnChannel(SDP2_CHANNEL);
+
+  delay(1000);  // Let sensors stabilise before entering the main loop
+}
+
+// ---------------- Main loop ----------------
+
+void loop() {
+  // Read ambient temperature and humidity from the DHT11
+  float humidity = dht.readHumidity();
+  float tempC = dht.readTemperature();
+
+  // NaN indicates a failed read (sensor absent, wiring fault, etc.)
+  bool dhtOk = !(isnan(humidity) || isnan(tempC));
+
+  // Thermal protection: trigger shutdown if temp is too high and we're not already shut down
+  if (dhtOk && !shutdownActive && tempC >= TEMP_SHUTDOWN_C) {
+    enterShutdown(tempC);
+  }
+
+  // Recovery: exit shutdown once temperature has dropped to the safe threshold
+  if (dhtOk && shutdownActive && tempC <= TEMP_RESET_C) {
+    exitShutdown();
+  }
+
+  // While in shutdown, only log temperature over serial and skip all sensor/display work
+  if (shutdownActive) {
+    Serial.println(F("--------------------"));
+    Serial.println(F("FAILSAFE ACTIVE: OLED OFF"));
+
+    if (dhtOk) {
+      Serial.print(F("Temperature: "));
+      Serial.print(tempC, 1);
+      Serial.println(F(" C"));
+
+      Serial.print(F("Humidity: "));
+      Serial.print(humidity, 1);
+      Serial.println(F(" %RH"));
+    } else {
+      Serial.println(F("DHT11: ERROR"));
+    }
+
+    delay(1000);
+    return;  // Skip the rest of the loop until recovery
+  }
+
+  // Pressure readings and SDP internal temperatures (the latter used by the driver, not displayed)
+  float p1 = 0.0;
+  float p2 = 0.0;
+  float sdpTemp1 = 0.0;
+  float sdpTemp2 = 0.0;
+
+  // Auto-recover: try to (re)start any sensor that is marked as not running
+  if (!sdp1Started) {
+    sdp1Started = startSdpOnChannel(SDP1_CHANNEL);
+  }
+
+  if (!sdp2Started) {
+    sdp2Started = startSdpOnChannel(SDP2_CHANNEL);
+  }
+
+  bool p1Ok = false;  // Will be set true only if the read succeeds
+  bool p2Ok = false;
+
+  if (sdp1Started) {
+    p1Ok = readSdpOnChannel(SDP1_CHANNEL, p1, sdpTemp1);
+
+    if (!p1Ok) {
+      sdp1Started = false;  // Flag for restart on the next loop iteration
+    }
+  }
+
+  if (sdp2Started) {
+    p2Ok = readSdpOnChannel(SDP2_CHANNEL, p2, sdpTemp2);
+
+    if (!p2Ok) {
+      sdp2Started = false;  // Flag for restart on the next loop iteration
+    }
+  }
+
+  float diff = p1 - p2;  // Pressure drop across the filter (positive = flow in expected direction)
+
+  // --- Serial debug output ---
+
+  Serial.println(F("--------------------"));
+
+  Serial.print(F("P1: "));
+  if (p1Ok) {
+    if (pressureInRange(p1)) {
+      Serial.print(p1, 1);
+      Serial.println(F(" Pa"));
+    } else {
+      Serial.println(F("OUT OF RANGE"));
+    }
+  } else {
+    Serial.println(F("ERROR"));
+  }
+
+  Serial.print(F("P2: "));
+  if (p2Ok) {
+    if (pressureInRange(p2)) {
+      Serial.print(p2, 1);
+      Serial.println(F(" Pa"));
+    } else {
+      Serial.println(F("OUT OF RANGE"));
+    }
+  } else {
+    Serial.println(F("ERROR"));
+  }
+
+  // Only print the differential if both readings are valid and in range
+  Serial.print(F("P1 - P2: "));
+  if (p1Ok && p2Ok && pressureInRange(p1) && pressureInRange(p2)) {
+    Serial.print(diff, 1);
+    Serial.println(F(" Pa"));
+  } else {
+    Serial.println(F("ERROR"));
+  }
+
+  if (dhtOk) {
+    Serial.print(F("Temperature: "));
+    Serial.print(tempC, 1);
+    Serial.println(F(" C"));
+
+    Serial.print(F("Humidity: "));
+    Serial.print(humidity, 1);
+    Serial.println(F(" %RH"));
+  } else {
+    Serial.println(F("DHT11: ERROR"));
+  }
+
+  // Push all readings to the OLED display
+  drawScreen(p1, p1Ok, p2, p2Ok, diff, tempC, humidity, dhtOk);
+
+  delay(1000);  // Wait 1 second before the next measurement cycle
+}
