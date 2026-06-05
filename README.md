@@ -10,7 +10,7 @@ without disturbing primary drop placement.
 
 The design is underpinned by Euler–Lagrange CFD simulations in OpenFOAM, validated against a reduced-scale experimental rig using  shadowgraphy, and realised as a physical prototype compatible with Agfa printers. 
 
-This repository serves as the central handover package for prototype evaluation and future project continuation.
+This repository serves as the central handover package for prototype evaluation and future project continuation. The repository for the simulations and custom OpenFOAM solver can be found in https://github.com/Nolanlau/KinematicDualParcelCloud.
 
 ## What's in this repo
 - `CAD/` — Assembly and part drawings for the experimental rig and extractor prototype
