@@ -17,6 +17,6 @@ This repository serves as the central handover package for prototype evaluation 
 ## What's in this repo
 - `CFD/` — OpenFOAM solver and post-processing scripts
 - `CAD/` — Assembly and part drawings for the experimental rig and extractor prototype
-- `Electronics/` — Arduino pump control code and wiring schematics
+- `Electronics/` — Arduino sensor control code and wiring schematics
 - `Documentation/` — Risk assessments, Bill of Materials, Product Design Specification, and end-of-life plan
 - `Reports/` — Final project report
